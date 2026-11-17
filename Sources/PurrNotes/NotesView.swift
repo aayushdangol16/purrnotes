@@ -19,8 +19,11 @@ enum Theme {
     }
 }
 
+/// The window's content: a Notes / To-Do switch in the header, then the chosen page.
 struct NotesRootView: View {
     @ObservedObject var store: NotesStore
+    @ObservedObject var todos: TodoStore
+    @ObservedObject var panel: PanelState
     var onClose: () -> Void
 
     @State private var confirmingDelete = false
@@ -30,16 +33,27 @@ struct NotesRootView: View {
         VStack(spacing: 0) {
             header
             Group {
-                if store.showingList { list } else { editor }
+                if panel.tab == .todo {
+                    TodoListView(todos: todos, panel: panel)
+                } else if store.showingList {
+                    list
+                } else {
+                    editor
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             footer
         }
         .background(Theme.paper)
-        .frame(minWidth: 260, minHeight: 240)
+        .frame(minWidth: 280, minHeight: 240)
         .ignoresSafeArea()
         .tint(Theme.accent)
-        .onChange(of: store.focusTick) { _ in focusEditor() }
+        .onChange(of: store.focusTick) { _ in
+            if panel.tab == .notes { focusEditor() }
+        }
+        .onChange(of: panel.tab) { tab in
+            if tab == .notes { focusEditor() }
+        }
         .confirmationDialog("Delete this note?", isPresented: $confirmingDelete) {
             Button("Delete", role: .destructive) {
                 if let id = store.selectedID { store.delete(id) }
@@ -54,32 +68,27 @@ struct NotesRootView: View {
     // MARK: Header
 
     private var header: some View {
-        HStack(spacing: 4) {
-            IconButton(symbol: store.showingList ? "chevron.left" : "list.bullet",
-                       help: store.showingList ? "Back to note" : "All notes") {
-                store.showingList.toggle()
-            }
-            Image(systemName: "pawprint.fill")
-                .font(.system(size: 11))
-                .foregroundStyle(Theme.accent)
-                .padding(.leading, 2)
-            Text(store.showingList ? "Notes" : (store.currentNote?.title ?? "Notes"))
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .foregroundStyle(Theme.ink)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Spacer(minLength: 8)
-            IconButton(symbol: "square.and.pencil", help: "New note (⌘N)") {
-                store.newNote()
-            }
-            if !store.showingList {
-                IconButton(symbol: "trash", help: "Delete note") {
-                    guard let note = store.currentNote else { return }
-                    if note.isBlank {
-                        store.delete(note.id)
-                        focusEditor()
-                    } else {
-                        confirmingDelete = true
+        HStack(spacing: 2) {
+            TabSwitch(tab: $panel.tab, pendingCount: todos.pending.count)
+                .fixedSize()   // the page names must never be truncated
+            Spacer(minLength: 4)
+            if panel.tab == .notes {
+                IconButton(symbol: store.showingList ? "chevron.left" : "list.bullet",
+                           help: store.showingList ? "Back to note" : "All notes") {
+                    store.showingList.toggle()
+                }
+                IconButton(symbol: "square.and.pencil", help: "New note (⌘N)") {
+                    store.newNote()
+                }
+                if !store.showingList {
+                    IconButton(symbol: "trash", help: "Delete note") {
+                        guard let note = store.currentNote else { return }
+                        if note.isBlank {
+                            store.delete(note.id)
+                            focusEditor()
+                        } else {
+                            confirmingDelete = true
+                        }
                     }
                 }
             }
@@ -144,12 +153,15 @@ struct NotesRootView: View {
 
     private var footer: some View {
         HStack(spacing: 5) {
+            let saving = store.hasUnsavedChanges || todos.hasUnsavedChanges
             Circle()
-                .fill(store.hasUnsavedChanges ? Theme.accent : Color.green.opacity(0.75))
+                .fill(saving ? Theme.accent : Color.green.opacity(0.75))
                 .frame(width: 6, height: 6)
-            Text(store.hasUnsavedChanges ? "Saving…" : "Saved")
+            Text(saving ? "Saving…" : "Saved")
             Spacer()
-            if store.showingList {
+            if panel.tab == .todo {
+                Text("\(todos.pending.count) to do · \(todos.completed.count) done")
+            } else if store.showingList {
                 Text(store.notes.count == 1 ? "1 note" : "\(store.notes.count) notes")
             } else {
                 let words = store.currentNote?.wordCount ?? 0
@@ -193,6 +205,53 @@ private struct NoteRow: View {
         )
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+    }
+}
+
+/// The "Notes | To-Do" pill switch. ⌘1 and ⌘2 switch pages from the keyboard.
+private struct TabSwitch: View {
+    @Binding var tab: PanelState.Tab
+    let pendingCount: Int
+
+    var body: some View {
+        HStack(spacing: 2) {
+            pill(.notes, title: "Notes", badge: nil, key: "1")
+            pill(.todo, title: "To-Do", badge: pendingCount > 0 ? pendingCount : nil, key: "2")
+        }
+        .padding(2)
+        .background(Capsule().fill(Theme.ink.opacity(0.08)))
+    }
+
+    private func pill(_ target: PanelState.Tab, title: String, badge: Int?, key: KeyEquivalent) -> some View {
+        let selected = tab == target
+        return Button {
+            withAnimation(.easeInOut(duration: 0.15)) { tab = target }
+        } label: {
+            HStack(spacing: 4) {
+                Text(title)
+                if let badge {
+                    Text("\(badge)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Theme.accent.opacity(selected ? 0.3 : 0.2)))
+                }
+            }
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(Theme.ink.opacity(selected ? 0.95 : 0.55))
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .frame(height: 24)
+            .background(
+                Capsule()
+                    .fill(selected ? Theme.paper : Color.clear)
+                    .shadow(color: .black.opacity(selected ? 0.12 : 0), radius: 1, y: 0.5)
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(key, modifiers: .command)
+        .help("\(title) (⌘\(String(key.character)))")
     }
 }
 

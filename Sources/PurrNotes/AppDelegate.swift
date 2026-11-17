@@ -4,6 +4,8 @@ import ServiceManagement
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = NotesStore()
+    private let todos = TodoStore()
+    private let panelState = PanelState()
     private var pet: PetController!
     private var notes: NotesWindowController!
     private var statusItem: NSStatusItem!
@@ -18,7 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         buildMainMenu()
 
-        notes = NotesWindowController(store: store)
+        notes = NotesWindowController(store: store, todos: todos, state: panelState)
         pet = PetController()
         pet.onClick = { [weak self] in self?.toggleNotes() }
         pet.menuProvider = { [weak self] in
@@ -43,13 +45,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         pet.start()
         DebugTools.runLaunchHooks(notes: notes,
+                                  panel: panelState,
                                   open: { [weak self] in self?.openNotes() },
                                   status: { [weak self] in self?.pet.debugStatus ?? "no cat" },
-                                  perform: { [weak self] in self?.pet.debugPerform($0) })
+                                  perform: { [weak self] in self?.pet.debugPerform($0) },
+                                  todos: todos)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         store.flush()
+        todos.flush()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -62,8 +67,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func populate(_ menu: NSMenu) {
-        menu.addItem(item(notes.isOpen ? "Close Notes" : "Open Notes", #selector(toggleNotes)))
+        if notes.isOpen {
+            menu.addItem(item("Close Window", #selector(closeNotes)))
+        } else {
+            menu.addItem(item("Open Notes", #selector(openNotesTab)))
+            menu.addItem(item("Open To-Do List", #selector(openTodoTab)))
+        }
         menu.addItem(item("New Note", #selector(newNote)))
+        menu.addItem(item("New Task", #selector(newTask)))
         menu.addItem(.separator())
 
         let sizeItem = NSMenuItem(title: "Cat Size", action: nil, keyEquivalent: "")
@@ -109,6 +120,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let file = NSMenu(title: "File")
         file.addItem(item("New Note", #selector(newNote), key: "n"))
+        let task = item("New Task", #selector(newTask), key: "n")
+        task.keyEquivalentModifierMask = [.command, .shift]
+        file.addItem(task)
         file.addItem(item("Close", #selector(closeNotes), key: "w"))
         let fileItem = NSMenuItem()
         fileItem.submenu = file
@@ -146,8 +160,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func newNote() {
+        panelState.tab = .notes
         store.newNote()
         if !notes.isOpen { openNotes() }
+    }
+
+    @objc private func newTask() {
+        panelState.tab = .todo
+        if notes.isOpen { panelState.focusAddTask() } else { openNotes() }
+    }
+
+    @objc private func openNotesTab() {
+        panelState.tab = .notes
+        openNotes()
+    }
+
+    @objc private func openTodoTab() {
+        panelState.tab = .todo
+        openNotes()
     }
 
     @objc private func setSize(_ sender: NSMenuItem) {

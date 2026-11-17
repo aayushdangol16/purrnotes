@@ -18,14 +18,18 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
 
     private let panel: NotesPanel
     private let store: NotesStore
+    private let todos: TodoStore
+    private let state: PanelState
 
-    init(store: NotesStore) {
+    init(store: NotesStore, todos: TodoStore, state: PanelState) {
         self.store = store
+        self.todos = todos
+        self.state = state
 
         var size = NSSize(width: 340, height: 400)
         if let saved = UserDefaults.standard.string(forKey: Self.sizeKey) {
             let s = NSSizeFromString(saved)
-            if s.width >= 260, s.height >= 240 { size = s }
+            if s.height >= 240 { size = NSSize(width: max(s.width, 280), height: s.height) }
         }
 
         panel = NotesPanel(contentRect: NSRect(origin: .zero, size: size),
@@ -42,12 +46,12 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        panel.minSize = NSSize(width: 260, height: 240)
+        panel.minSize = NSSize(width: 280, height: 240)
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             panel.standardWindowButton(button)?.isHidden = true
         }
 
-        let hosting = NSHostingView(rootView: NotesRootView(store: store, onClose: { [weak self] in
+        let hosting = NSHostingView(rootView: NotesRootView(store: store, todos: todos, panel: state, onClose: { [weak self] in
             self?.close()
         }))
         hosting.sizingOptions = []
@@ -73,7 +77,7 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
-        store.requestFocus()
+        if state.tab == .notes { store.requestFocus() } else { state.focusAddTask() }
         onVisibilityChange?(true)
     }
 
@@ -85,6 +89,7 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         UserDefaults.standard.set(NSStringFromSize(panel.frame.size), forKey: Self.sizeKey)
         store.tidyAndSave()
+        todos.flush()
         onVisibilityChange?(false)
     }
 }

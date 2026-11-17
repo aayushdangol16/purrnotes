@@ -8,6 +8,7 @@ import AppKit
 ///   --export-iconset <dir>        write the PNGs for AppIcon.iconset
 ///   --selftest                    exercise note saving/loading in a temp folder
 ///   --snapshot-notes <file.png>   launch, open the notes window, save a picture of it, quit
+///                                 (`--tab todo` for the To-Do page, `--appearance light|dark`)
 ///   --login-item status|on|off    read or change Launch at Login (run from inside the .app)
 ///   --trace                       launch, click / lift / drop the cat in code, print what it does, quit
 @MainActor
@@ -40,8 +41,14 @@ enum DebugTools {
         return false
     }
 
-    static func runLaunchHooks(notes: NotesWindowController, open: @escaping () -> Void,
-                               status: @escaping () -> String, perform: @escaping (String) -> Void) {
+    static func runLaunchHooks(notes: NotesWindowController, panel: PanelState, open: @escaping () -> Void,
+                               status: @escaping () -> String, perform: @escaping (String) -> Void,
+                               todos: TodoStore? = nil) {
+        if CommandLine.arguments.contains("--todo-input-test"), let todos {
+            panel.tab = .todo
+            Task { @MainActor in await todoInputTest(notes: notes, todos: todos, open: open) }
+            return
+        }
         if CommandLine.arguments.contains("--trace") {
             // Step index (every 0.25 s) -> scripted input.
             let script = [8: "click", 18: "click", 28: "lift", 32: "drop"]
@@ -61,6 +68,14 @@ enum DebugTools {
             return
         }
         guard let path = value(after: "--snapshot-notes", in: CommandLine.arguments) else { return }
+        if let tab = value(after: "--tab", in: CommandLine.arguments).flatMap(PanelState.Tab.init(rawValue:)) {
+            panel.tab = tab
+        }
+        switch value(after: "--appearance", in: CommandLine.arguments) {
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        default: break
+        }
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 800_000_000)
             open()
@@ -72,6 +87,111 @@ enum DebugTools {
             print("notes window visible=\(notes.isOpen) key=\(notes.isKey) appActive=\(NSApp.isActive)")
             NSApp.terminate(nil)
         }
+    }
+
+    /// Sends real key and mouse events to the To-Do page, the same way typing and
+    /// clicking would arrive, and reports what happened. Run with PURRNOTES_DIR set.
+    private static func todoInputTest(notes: NotesWindowController, todos: TodoStore, open: () -> Void) async {
+        func pause(_ s: Double = 0.35) async { try? await Task.sleep(nanoseconds: UInt64(s * 1e9)) }
+        var failures = 0
+        func check(_ ok: Bool, _ label: String) {
+            print(ok ? "  ok    \(label)" : "  FAIL  \(label)")
+            if !ok { failures += 1 }
+            let list = todos.items.map { "\($0.isDone ? "[x]" : "[ ]") \($0.title)" }.joined(separator: " | ")
+            if CommandLine.arguments.contains("--verbose") { print("          list: \(list)") }
+        }
+        guard let window = notes.contentView?.window else { print("no window"); exit(1) }
+        func panelTab() -> String { UserDefaults.standard.string(forKey: "panelTab") ?? "?" }
+
+        func key(_ code: UInt16, _ chars: String) {
+            for type in [NSEvent.EventType.keyDown, .keyUp] {
+                if let e = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                            windowNumber: window.windowNumber, context: nil, characters: chars,
+                                            charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) {
+                    window.sendEvent(e)
+                }
+            }
+        }
+        func type(_ text: String) { for ch in text { key(0, String(ch)) } }
+        func ret() { key(36, "\r") }
+        func esc() { key(53, "\u{1b}") }
+        func click(atFromTop y: CGFloat, x: CGFloat, count: Int) {
+            let p = NSPoint(x: x, y: (window.contentView?.bounds.height ?? 0) - y)
+            for n in 1...count {
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    if let e = NSEvent.mouseEvent(with: type, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                  windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                                                  clickCount: n, pressure: 1) {
+                        window.sendEvent(e)
+                    }
+                }
+            }
+        }
+
+        var shot = 0
+        func snapshot(_ label: String) {
+            guard let dir = value(after: "--shots", in: CommandLine.arguments),
+                  let view = notes.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            shot += 1
+            write(rep, to: "\(dir)/\(shot)-\(label).png")
+            print("          shot \(shot)-\(label): view \(view.bounds.size) contentLayout \(window.contentLayoutRect.size)")
+        }
+
+        await pause(0.8)
+        open()
+        await pause(0.8)
+
+        type("Buy milk"); ret(); await pause()
+        type("Feed the cat"); ret(); await pause()
+        check(todos.pending.map(\.title) == ["Buy milk", "Feed the cat"],
+              "typing + Return adds tasks, and the field stays ready for the next one")
+
+        esc(); await pause()
+        check(!notes.isOpen, "Esc in the add field closes the window, like other quick panels")
+        open()
+        await pause(0.8)
+        check(notes.isOpen, "the window reopens on the To-Do page")
+
+        // Double-click the first task's text to edit it.
+        let firstRowY: CGFloat = 38 + 40 + 1 + 8 + 14
+        click(atFromTop: firstRowY, x: 120, count: 2); await pause()
+        type(" and eggs"); await pause(0.2)
+        esc(); await pause()
+        check(notes.isOpen, "Esc while editing a task leaves the window open")
+        check(todos.pending.first?.title == "Buy milk", "Esc while editing discards the change")
+
+        // Starting an edit selects the whole text (like renaming in Finder), so typing replaces it.
+        click(atFromTop: firstRowY, x: 120, count: 2); await pause()
+        snapshot("after-double-click")
+        type("Buy milk and eggs"); await pause(0.2)
+        snapshot("after-typing")
+        ret(); await pause()
+        check(todos.pending.map(\.title) == ["Buy milk and eggs", "Feed the cat"],
+              "double-click, type, Return saves the edit to that task only")
+
+        click(atFromTop: firstRowY, x: 120, count: 2); await pause()
+        type("Buy oat milk"); await pause(0.2)
+        click(atFromTop: 20, x: 60, count: 1); await pause()   // click the Notes tab: the edit loses focus
+        check(todos.pending.first?.title == "Buy oat milk", "clicking away while editing saves the edit")
+        click(atFromTop: 20, x: 100, count: 1); await pause(0.6)   // back to To-Do
+        check(panelTab() == "todo", "clicking the To-Do pill switches back")
+
+        // Click the first checkbox.
+        click(atFromTop: firstRowY, x: 25, count: 1); await pause(0.6)
+        check(todos.completed.map(\.title) == ["Buy oat milk"], "clicking a checkbox marks that task done")
+        snapshot("after-check")
+        // Second row is now "Feed the cat"; check it too, with the pointer resting on it like a real click.
+        click(atFromTop: firstRowY, x: 25, count: 1); await pause(0.6)
+        snapshot("after-second-check")
+        // Uncheck the first completed row ("Feed the cat"), just under the "Completed" heading.
+        click(atFromTop: firstRowY + 22, x: 25, count: 1); await pause(0.6)
+        check(todos.pending.map(\.title) == ["Feed the cat"], "unchecking a completed task moves it back")
+        snapshot("after-uncheck")
+
+        todos.flush()
+        print(failures == 0 ? "PASS" : "FAILED (\(failures))")
+        NSApp.terminate(nil)
     }
 
     private static func value(after flag: String, in args: [String]) -> String? {
@@ -209,6 +329,58 @@ enum DebugTools {
               "an unreadable file is set aside, not overwritten")
         third.ensureSelection()
         check(third.currentNote != nil, "a fresh note is available after recovery")
+
+        // To-dos live in their own file beside the notes.
+        print("  -- to-dos")
+        let todoDir = dir.appendingPathComponent("todos", isDirectory: true)
+        let notesBeside = NotesStore(directory: todoDir)
+        notesBeside.updateCurrentText("A note that must survive")
+        notesBeside.flush()
+        let notesBytes = try? Data(contentsOf: notesBeside.fileURL)
+
+        let t1 = TodoStore(directory: todoDir)
+        check(t1.items.isEmpty, "first launch starts with an empty to-do list")
+        check(!t1.add("   \n  "), "blank tasks are ignored")
+        t1.add("Buy cat food")
+        t1.add("Water the plants")
+        t1.add("Call  the vet\nabout shots")
+        check(t1.pending.map(\.title) == ["Buy cat food", "Water the plants", "Call  the vet about shots"],
+              "tasks are listed in the order they were added")
+        let food = t1.pending[0].id, plants = t1.pending[1].id, vet = t1.pending[2].id
+        t1.toggle(food)
+        check(t1.completed.first?.id == food && t1.completed.first?.completedAt != nil,
+              "a checked task moves to Completed")
+        check(!t1.pending.contains { $0.id == food }, "a checked task leaves the pending list")
+        t1.rename(plants, to: "Water the plants twice")
+        t1.rename(vet, to: "   ")
+        check(t1.items.first { $0.id == plants }?.title == "Water the plants twice", "tasks can be edited")
+        check(t1.items.first { $0.id == vet }?.title == "Call  the vet about shots",
+              "editing a task down to nothing keeps the old text")
+        t1.delete(vet)
+        check(t1.items.count == 2, "tasks can be deleted")
+        t1.flush()
+
+        let t2 = TodoStore(directory: todoDir)
+        // Dates are stored to the second, so compare what the user sees.
+        func summary(_ items: [TodoItem]) -> [String] {
+            items.map { "\($0.id) \($0.title) \($0.isDone) \($0.completedAt != nil)" }
+        }
+        check(summary(t2.items) == summary(t1.items) && t2.completed.first?.id == food,
+              "tasks, edits and checkmarks survive a relaunch")
+        t2.toggle(food)
+        check(t2.pending.contains { $0.id == food } && t2.items.first { $0.id == food }?.completedAt == nil,
+              "unchecking puts a task back")
+        t2.flush()
+        check(TodoStore(directory: todoDir).pending.count == 2, "unchecking persists")
+        check((try? Data(contentsOf: notesBeside.fileURL)) == notesBytes, "to-do saves never touch notes.json")
+
+        try? Data("{ broken".utf8).write(to: t2.fileURL)
+        let t3 = TodoStore(directory: todoDir)
+        let todoLeftovers = (try? FileManager.default.contentsOfDirectory(atPath: todoDir.path)) ?? []
+        check(t3.items.isEmpty && todoLeftovers.contains { $0.hasPrefix("todos.unreadable-") },
+              "an unreadable to-do file is set aside, not overwritten")
+        check(NotesStore(directory: todoDir).currentNote?.text == "A note that must survive",
+              "notes still load when the to-do file is broken")
 
         print(failures == 0 ? "PASS" : "FAILED (\(failures))")
         return failures == 0
