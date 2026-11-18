@@ -19,11 +19,12 @@ enum Theme {
     }
 }
 
-/// The window's content: a Notes / To-Do switch in the header, then the chosen page.
+/// The window's content: a Notes / To-Do / Work switch in the header, then the chosen page.
 struct NotesRootView: View {
     @ObservedObject var store: NotesStore
     @ObservedObject var todos: TodoStore
     @ObservedObject var panel: PanelState
+    @ObservedObject var workstation: Workstation
     var onClose: () -> Void
 
     @State private var confirmingDelete = false
@@ -35,6 +36,8 @@ struct NotesRootView: View {
             Group {
                 if panel.tab == .todo {
                     TodoListView(todos: todos, panel: panel)
+                } else if panel.tab == .work {
+                    WorkstationView(workstation: workstation)
                 } else if store.showingList {
                     list
                 } else {
@@ -45,7 +48,7 @@ struct NotesRootView: View {
             footer
         }
         .background(Theme.paper)
-        .frame(minWidth: 280, minHeight: 240)
+        .frame(minWidth: NotesWindowController.minSize.width, minHeight: NotesWindowController.minSize.height)
         .ignoresSafeArea()
         .tint(Theme.accent)
         .onChange(of: store.focusTick) { _ in
@@ -69,7 +72,8 @@ struct NotesRootView: View {
 
     private var header: some View {
         HStack(spacing: 2) {
-            TabSwitch(tab: $panel.tab, pendingCount: todos.pending.count)
+            TabSwitch(tab: $panel.tab, pendingCount: todos.pending.count,
+                      workActive: workstation.phase != .idle)
                 .fixedSize()   // the page names must never be truncated
             Spacer(minLength: 4)
             if panel.tab == .notes {
@@ -153,7 +157,7 @@ struct NotesRootView: View {
 
     private var footer: some View {
         HStack(spacing: 5) {
-            let saving = store.hasUnsavedChanges || todos.hasUnsavedChanges
+            let saving = store.hasUnsavedChanges || todos.hasUnsavedChanges || workstation.hasUnsavedChanges
             Circle()
                 .fill(saving ? Theme.accent : Color.green.opacity(0.75))
                 .frame(width: 6, height: 6)
@@ -161,6 +165,8 @@ struct NotesRootView: View {
             Spacer()
             if panel.tab == .todo {
                 Text("\(todos.pending.count) to do · \(todos.completed.count) done")
+            } else if panel.tab == .work {
+                Text("\(workstation.enabledApps.count) of \(workstation.apps.count) apps on")
             } else if store.showingList {
                 Text(store.notes.count == 1 ? "1 note" : "\(store.notes.count) notes")
             } else {
@@ -208,26 +214,33 @@ private struct NoteRow: View {
     }
 }
 
-/// The "Notes | To-Do" pill switch. ⌘1 and ⌘2 switch pages from the keyboard.
+/// The "Notes | To-Do | Work" pill switch. ⌘1, ⌘2 and ⌘3 switch pages from the keyboard.
 private struct TabSwitch: View {
     @Binding var tab: PanelState.Tab
     let pendingCount: Int
+    let workActive: Bool
 
     var body: some View {
         HStack(spacing: 2) {
             pill(.notes, title: "Notes", badge: nil, key: "1")
             pill(.todo, title: "To-Do", badge: pendingCount > 0 ? pendingCount : nil, key: "2")
+            pill(.work, title: "Work", badge: nil, key: "3", dot: workActive, help: "Workstation")
         }
         .padding(2)
         .background(Capsule().fill(Theme.ink.opacity(0.08)))
     }
 
-    private func pill(_ target: PanelState.Tab, title: String, badge: Int?, key: KeyEquivalent) -> some View {
+    private func pill(_ target: PanelState.Tab, title: String, badge: Int?, key: KeyEquivalent,
+                      dot: Bool = false, help: String? = nil) -> some View {
         let selected = tab == target
         return Button {
             withAnimation(.easeInOut(duration: 0.15)) { tab = target }
         } label: {
             HStack(spacing: 4) {
+                if dot {
+                    // The workstation is running.
+                    Circle().fill(Color.green.opacity(0.8)).frame(width: 6, height: 6)
+                }
                 Text(title)
                 if let badge {
                     Text("\(badge)")
@@ -251,7 +264,7 @@ private struct TabSwitch: View {
         }
         .buttonStyle(.plain)
         .keyboardShortcut(key, modifiers: .command)
-        .help("\(title) (⌘\(String(key.character)))")
+        .help("\(help ?? title) (⌘\(String(key.character)))")
     }
 }
 

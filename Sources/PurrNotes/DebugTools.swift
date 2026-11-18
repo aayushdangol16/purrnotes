@@ -10,6 +10,7 @@ import AppKit
 ///   --snapshot-notes <file.png>   launch, open the notes window, save a picture of it, quit
 ///                                 (`--tab todo` for the To-Do page, `--appearance light|dark`)
 ///   --login-item status|on|off    read or change Launch at Login (run from inside the .app)
+///   --workstation-test            open and close Calculator + Chess through the workstation (needs PURRNOTES_DIR)
 ///   --trace                       launch, click / lift / drop the cat in code, print what it does, quit
 @MainActor
 enum DebugTools {
@@ -35,6 +36,10 @@ enum DebugTools {
             }
             return true
         }
+        if let id = value(after: "--fs-probe", in: args) {
+            print(FullScreen.probe(bundleID: id))
+            return true
+        }
         if args.contains("--selftest") {
             exit(storeSelfTest() ? 0 : 1)
         }
@@ -43,7 +48,17 @@ enum DebugTools {
 
     static func runLaunchHooks(notes: NotesWindowController, panel: PanelState, open: @escaping () -> Void,
                                status: @escaping () -> String, perform: @escaping (String) -> Void,
-                               todos: TodoStore? = nil) {
+                               todos: TodoStore? = nil, workstation: Workstation? = nil) {
+        if CommandLine.arguments.contains("--fullscreen-sequence-test"), let workstation {
+            panel.tab = .work
+            Task { @MainActor in await fullScreenSequenceTest(workstation: workstation) }
+            return
+        }
+        if CommandLine.arguments.contains("--workstation-test"), let workstation {
+            panel.tab = .work
+            Task { @MainActor in await workstationTest(notes: notes, workstation: workstation, open: open) }
+            return
+        }
         if CommandLine.arguments.contains("--todo-input-test"), let todos {
             panel.tab = .todo
             Task { @MainActor in await todoInputTest(notes: notes, todos: todos, open: open) }
@@ -80,6 +95,19 @@ enum DebugTools {
             try? await Task.sleep(nanoseconds: 800_000_000)
             open()
             try? await Task.sleep(nanoseconds: 1_200_000_000)
+            // `--click x,y` (points from the top-left) clicks once before the picture is taken.
+            if let spot = value(after: "--click", in: CommandLine.arguments)?.split(separator: ",").compactMap({ Double($0) }),
+               spot.count == 2, let window = notes.contentView?.window, let view = notes.contentView {
+                let p = NSPoint(x: spot[0], y: view.bounds.height - spot[1])
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    if let e = NSEvent.mouseEvent(with: type, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                  windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                                                  clickCount: 1, pressure: 1) {
+                        window.sendEvent(e)
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 600_000_000)
+            }
             if let view = notes.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
                 view.cacheDisplay(in: view.bounds, to: rep)
                 write(rep, to: path)
@@ -193,6 +221,201 @@ enum DebugTools {
         print(failures == 0 ? "PASS" : "FAILED (\(failures))")
         NSApp.terminate(nil)
     }
+
+    /// Exercises the workstation with two harmless system apps, Calculator and Chess,
+    /// in a throwaway folder. It refuses to run against the real settings folder or
+    /// if either app is already open, so it can never quit something you are using.
+    private static func workstationTest(notes: NotesWindowController, workstation ws: Workstation,
+                                        open: () -> Void) async {
+        func pause(_ s: Double) async { try? await Task.sleep(nanoseconds: UInt64(s * 1e9)) }
+        var failures = 0
+        func check(_ ok: Bool, _ label: String) {
+            print(ok ? "  ok    \(label)" : "  FAIL  \(label)")
+            if !ok { failures += 1 }
+        }
+        func abort(_ why: String) -> Never {
+            print("ABORTED: \(why)")
+            exit(2)
+        }
+
+        let calcID = "com.apple.calculator", chessID = "com.apple.Chess"
+        guard ProcessInfo.processInfo.environment["PURRNOTES_DIR"]?.isEmpty == false else {
+            abort("set PURRNOTES_DIR to a throwaway folder")
+        }
+        guard let calcURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: calcID),
+              let chessURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: chessID) else {
+            abort("Calculator or Chess is not installed")
+        }
+        func running(_ id: String) -> [NSRunningApplication] {
+            NSRunningApplication.runningApplications(withBundleIdentifier: id).filter { !$0.isTerminated }
+        }
+        guard running(calcID).isEmpty, running(chessID).isEmpty else {
+            abort("Calculator or Chess is already open; close it first so the test can't touch it")
+        }
+
+        // Set up: Calculator, a missing app, Chess, in that order.
+        for app in ws.apps { ws.remove(app.id) }
+        ws.add(path: calcURL.path)
+        ws.add(path: "/Applications/PurrNotes Missing Test App.app")
+        ws.add(path: chessURL.path)
+        ws.pauseSeconds = 0.5
+        ws.flush()
+        // From here on, edits are not flushed before starting: the session must still match its apps after a reload.
+        let allowed = Set([calcURL.path, chessURL.path, "/Applications/PurrNotes Missing Test App.app"])
+        guard ws.apps.allSatisfy({ allowed.contains($0.path) }) else { abort("unexpected app in the test set-up") }
+        let dir = ws.configURL.deletingLastPathComponent()
+
+        // A fresh folder gets the default set-up: only installed apps from the default list.
+        let defaults = Workstation(directory: dir.appendingPathComponent("defaults", isDirectory: true))
+        check(defaults.apps.allSatisfy { Workstation.defaultBundleIDs.contains($0.bundleID ?? "") && defaults.isInstalled($0) },
+              "default set-up lists only installed apps from Safari / Brave / Terminal / VS Code (\(defaults.apps.map(\.name).joined(separator: ", ")))")
+        check(defaults.phase == .idle, "nothing launches until Start is pressed")
+        let defaultsAgain = Workstation(directory: dir.appendingPathComponent("defaults", isDirectory: true))
+        check(!defaults.apps.isEmpty && defaultsAgain.apps.map(\.id) == defaults.apps.map(\.id),
+              "the default set-up is saved, so apps keep the same identity across launches")
+
+        // Calculator is opened first by the test itself, so it counts as "already open".
+        let quiet = NSWorkspace.OpenConfiguration()
+        quiet.activates = false
+        guard let calc = try? await NSWorkspace.shared.openApplication(at: calcURL, configuration: quiet) else {
+            abort("could not open Calculator")
+        }
+        await pause(0.5)
+
+        open()
+        await pause(0.6)
+        await ws.start()
+        await pause(0.8)
+
+        let outcomes = ws.entries.map { "\($0.name)=\($0.outcome.rawValue)" }
+        print("          full-screen permission: \(FullScreen.isAllowed)")
+        print("          entries: \(outcomes.joined(separator: ", "))")
+        print("          message: \(ws.message ?? "-")")
+        check(ws.entries.map(\.id) == ws.apps.map(\.id), "apps are handled in the configured order")
+        check(ws.entries.first?.outcome == .alreadyRunning, "Calculator, already open, is marked as not ours")
+        check(ws.entries.dropFirst().first?.outcome == .failed, "a missing app is reported and skipped")
+        check(ws.entries.last?.outcome == .opened && ws.entries.last?.pid != nil, "Chess is launched and owned")
+        check(running(chessID).count == 1, "Chess is running")
+        check(ws.phase == .active && ws.ownedRunning.map(\.name) == ["Chess"], "the session owns only Chess")
+        if let chess = ws.entries.last, let pid = chess.pid {
+            print("          chess full screen: \(String(describing: chess.fullScreen)) note: \(chess.fullScreenNote ?? "-")")
+            print(FullScreen.probe(bundleID: chessID).split(separator: "\n").map { "          probe: \($0)" }.joined(separator: "\n"))
+            if FullScreen.isAllowed {
+                check(chess.fullScreen == true && FullScreen.isMainWindowFullScreen(pid: pid),
+                      "Chess went into full screen in its own Space")
+            } else {
+                check(chess.fullScreen == nil && (ws.message ?? "").contains("Accessibility"),
+                      "without permission Chess opens normally and the skip is reported once")
+            }
+        }
+        check(ws.entries.first?.fullScreen == nil, "Calculator, already open, was not put into full screen")
+        snapshot(notes, "workstation-active")
+
+        // The session survives a restart of PurrNotes.
+        let reloaded = Workstation(directory: dir)
+        check(reloaded.phase == .active && reloaded.ownedRunning.map(\.name) == ["Chess"],
+              "a reloaded session still knows it owns Chess")
+        check(reloaded.apps.map(\.path) == ws.apps.map(\.path) && reloaded.pauseSeconds == 0.5,
+              "the set-up (apps, order, pause) is saved")
+        check(reloaded.apps.allSatisfy { reloaded.entry(for: $0) != nil },
+              "after a reload every app still shows its session status")
+
+        // Safety: a record that doesn't match the live process exactly is never acted on.
+        if var chess = reloaded.entries.last {
+            chess.launchDate = chess.launchDate?.addingTimeInterval(3600)
+            check(Workstation.runningApp(for: chess) == nil, "a wrong launch time means the process is not ours")
+            chess = reloaded.entries.last!
+            chess.pid = calc.processIdentifier
+            check(Workstation.runningApp(for: chess) == nil, "another app's process id is never treated as ours")
+        }
+
+        await reloaded.end()
+        await pause(0.5)
+        print("          message: \(reloaded.message ?? "-")")
+        check(running(chessID).isEmpty, "ending the session quits Chess")
+        check(!calc.isTerminated && running(calcID).count == 1, "Calculator, already open before, is left running")
+        check(reloaded.phase == .idle && !FileManager.default.fileExists(atPath: reloaded.sessionURL.path),
+              "the session is cleared once everything it opened has quit")
+
+        await ws.end()
+        check(ws.phase == .idle, "ending again when nothing is left just finishes")
+
+        // Reordering and options are saved.
+        if let chess = ws.apps.last {
+            ws.move(chess.id, by: -1)
+            ws.update(chess.id) { $0.startHidden = true; $0.openTarget = "https://example.com" }
+            ws.flush()
+            let again = Workstation(directory: dir)
+            check(again.apps.map(\.name).last != "Chess" && again.apps.first { $0.id == chess.id }?.startHidden == true
+                  && again.apps.first { $0.id == chess.id }?.openTarget == "https://example.com",
+                  "order changes and per-app options are saved")
+        }
+
+        // Clean up the Calculator this test opened.
+        calc.terminate()
+        await pause(1)
+        check(calc.isTerminated, "the test's own Calculator was closed again")
+
+        print(failures == 0 ? "PASS" : "FAILED (\(failures))")
+        NSApp.terminate(nil)
+    }
+
+    /// Opens Chess, Maps and Dictionary through the workstation with full screen on,
+    /// checks that every one ends up in its own full-screen Space, then quits them.
+    /// Needs PURRNOTES_DIR and the Accessibility permission; refuses to run if any of
+    /// the three is already open.
+    private static func fullScreenSequenceTest(workstation ws: Workstation) async {
+        func pause(_ s: Double) async { try? await Task.sleep(nanoseconds: UInt64(s * 1e9)) }
+        var failures = 0
+        func check(_ ok: Bool, _ label: String) {
+            print(ok ? "  ok    \(label)" : "  FAIL  \(label)")
+            if !ok { failures += 1 }
+        }
+        let ids = ["com.apple.Chess", "com.apple.Maps", "com.apple.Dictionary"]
+        guard ProcessInfo.processInfo.environment["PURRNOTES_DIR"]?.isEmpty == false else {
+            print("ABORTED: set PURRNOTES_DIR"); exit(2)
+        }
+        guard FullScreen.isAllowed else { print("ABORTED: no Accessibility permission"); exit(2) }
+        let urls = ids.compactMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) }
+        guard urls.count == ids.count else { print("ABORTED: a test app is missing"); exit(2) }
+        guard ids.allSatisfy({ NSRunningApplication.runningApplications(withBundleIdentifier: $0).isEmpty }) else {
+            print("ABORTED: Chess, Maps or Dictionary is already open"); exit(2)
+        }
+        for app in ws.apps { ws.remove(app.id) }
+        for url in urls { ws.add(path: url.path) }
+        guard ws.apps.count == 3, ws.apps.allSatisfy({ urls.map(\.path).contains($0.path) }) else {
+            print("ABORTED: unexpected set-up"); exit(2)
+        }
+        ws.flush()
+
+        let started = Date()
+        await ws.start()
+        print(String(format: "          start took %.1f s", Date().timeIntervalSince(started)))
+        for e in ws.entries {
+            print("          \(e.name): \(e.outcome.rawValue) fullScreen=\(String(describing: e.fullScreen)) \(e.fullScreenNote ?? "")")
+        }
+        for (e, id) in zip(ws.entries, ids) {
+            let live = e.pid.map(FullScreen.isMainWindowFullScreen) ?? false
+            check(e.outcome == .opened && e.fullScreen == true && live, "\(e.name) is in its own full-screen Space")
+            if !live { print(FullScreen.probe(bundleID: id).split(separator: "\n").map { "          probe: \($0)" }.joined(separator: "\n")) }
+        }
+        await pause(1)
+        await ws.end()
+        await pause(1)
+        check(ids.allSatisfy { NSRunningApplication.runningApplications(withBundleIdentifier: $0).allSatisfy(\.isTerminated) },
+              "ending the session quits all three")
+        print(failures == 0 ? "PASS" : "FAILED (\(failures))")
+        NSApp.terminate(nil)
+    }
+
+    private static func snapshot(_ notes: NotesWindowController, _ label: String) {
+        guard let dir = value(after: "--shots", in: CommandLine.arguments),
+              let view = notes.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        write(rep, to: "\(dir)/\(label).png")
+    }
+
+    static func argument(after flag: String) -> String? { value(after: flag, in: CommandLine.arguments) }
 
     private static func value(after flag: String, in args: [String]) -> String? {
         guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }

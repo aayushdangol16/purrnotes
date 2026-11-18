@@ -32,10 +32,13 @@ final class PetWindow: NSPanel {
 
 /// Shows the cat and turns mouse input into click / drag callbacks.
 ///
-/// The cat is a single layer. Its walk, sit and sleep cycles are handed to Core
-/// Animation as looping image sequences, and walking across the screen is one
-/// position animation, so the system's compositor does the per-frame work and
-/// the app itself stays asleep until the cat changes its mind.
+/// The cat is a single layer showing pre-rendered frames. Nothing animates on
+/// its own: one timer in this view changes the frame (and, while walking, the
+/// position) a fixed number of times a second, so macOS only redraws the cat
+/// when it actually changes — about 24 times a second while walking and about 6
+/// while sitting or sleeping. Continuously running system animations would be
+/// redrawn at the display's full rate (120 Hz on ProMotion), and because the cat
+/// is on every desktop that extra work made switching desktops stutter.
 final class CatView: NSView {
     /// Size of the cat sprite in points.
     var catSize = CatRenderer.baseSize {
@@ -60,12 +63,35 @@ final class CatView: NSView {
     /// True between mouse-down and mouse-up on the cat.
     private(set) var isPressed = false
 
+    /// Frames per second while walking (position and legs).
+    static let walkingFPS: Double = 24
+
     private let sprite = CALayer()
     private var cache: [CatFrame.Key: CGImage] = [:]
     private var cachedBacking: CGFloat = 0
-    private var loop: (pose: CatPose, facingRight: Bool, start: CFTimeInterval, duration: CFTimeInterval)?
     private var downLocation = NSPoint.zero
     private var dragging = false
+
+    private struct Loop {
+        var pose: CatPose
+        var facingRight: Bool
+        var frames: [CatFrame]
+        var images: [CGImage]
+        var start: CFTimeInterval
+        var duration: CFTimeInterval
+        var shownIndex = -1
+    }
+    private struct Slide {
+        var from: CGFloat
+        var to: CGFloat
+        var start: CFTimeInterval
+        var duration: CFTimeInterval
+    }
+    private var loop: Loop?
+    private var slideState: Slide?
+    private var blinkUntil: CFTimeInterval = 0
+    private var timer: Timer?
+    private var timerRate: Double = 0
 
     private static let mirror = CATransform3DMakeScale(-1, 1, 1)
 
@@ -77,7 +103,7 @@ final class CatView: NSView {
         sprite.contentsGravity = .resize
         sprite.bounds = CGRect(origin: .zero, size: catSize)
         sprite.position = CGPoint(x: catSize.width / 2, y: catSize.height / 2)
-        // No implicit fades or slides: only the animations added below should run.
+        // No implicit fades or slides: every change shows up exactly as set.
         sprite.actions = ["contents": NSNull(), "transform": NSNull(), "bounds": NSNull(), "position": NSNull()]
         layer?.addSublayer(sprite)
     }
@@ -89,44 +115,38 @@ final class CatView: NSView {
 
     /// Puts the cat's left edge at `x` (view coordinates), cancelling any slide.
     func setCatX(_ x: CGFloat) {
+        slideState = nil
         withoutImplicitAnimation {
-            sprite.removeAnimation(forKey: "slide")
             sprite.position = CGPoint(x: x + catSize.width / 2, y: catSize.height / 2)
         }
+        updateTimer()
     }
 
-    /// Glides the cat between two positions at constant speed.
+    /// Walks the cat between two positions at constant speed.
     func slide(from: CGFloat, to: CGFloat, duration: CFTimeInterval) {
-        let half = catSize.width / 2
-        let move = CABasicAnimation(keyPath: "position.x")
-        move.fromValue = from + half
-        move.toValue = to + half
-        move.duration = duration
-        move.timingFunction = CAMediaTimingFunction(name: .linear)
+        slideState = Slide(from: from, to: to, start: CACurrentMediaTime(), duration: max(duration, 0.01))
         withoutImplicitAnimation {
-            sprite.position.x = to + half
-            sprite.add(move, forKey: "slide")
+            sprite.position = CGPoint(x: from + catSize.width / 2, y: catSize.height / 2)
         }
+        updateTimer()
     }
 
-    /// Where the cat's left edge is on screen right now, mid-slide included.
-    var presentedCatX: CGFloat? {
-        (sprite.presentation()?.position.x).map { $0 - catSize.width / 2 }
-    }
+    /// Where the cat's left edge is drawn right now (mid-walk included).
+    var presentedCatX: CGFloat? { sprite.position.x - catSize.width / 2 }
 
     // MARK: Appearance
 
     /// Shows one specific frame, stopping any running loop.
     func show(_ state: CatState) {
         loop = nil
+        blinkUntil = 0
         let frame = CatFrame(state)
         let image = self.image(for: frame)
         withoutImplicitAnimation {
-            sprite.removeAnimation(forKey: "loop")
-            sprite.removeAnimation(forKey: "blink")
             sprite.contents = image
             sprite.transform = frame.mirrored ? Self.mirror : CATransform3DIdentity
         }
+        updateTimer()
     }
 
     /// Plays a pose's animation cycle on repeat. `duration` is one full cycle.
@@ -134,40 +154,25 @@ final class CatView: NSView {
         let frames = CatFrame.loop(pose, facingRight: facingRight)
         let images = frames.compactMap { image(for: $0) }
         guard !frames.isEmpty, images.count == frames.count else { return }
-
-        let cycle = CAKeyframeAnimation(keyPath: "contents")
-        cycle.values = images
-        cycle.keyTimes = (0...images.count).map { NSNumber(value: Double($0) / Double(images.count)) }
-        cycle.calculationMode = .discrete
-        cycle.duration = duration
-        cycle.repeatCount = .infinity
-
-        withoutImplicitAnimation {
-            sprite.removeAnimation(forKey: "blink")
-            sprite.contents = images[0]
-            sprite.transform = frames[0].mirrored ? Self.mirror : CATransform3DIdentity
-            sprite.add(cycle, forKey: "loop")
-        }
-        loop = (pose, facingRight, CACurrentMediaTime(), duration)
+        loop = Loop(pose: pose, facingRight: facingRight, frames: frames, images: images,
+                    start: CACurrentMediaTime(), duration: max(duration, 0.05))
+        blinkUntil = 0
+        showLoopFrame(force: true)
+        updateTimer()
     }
 
     /// Closes the sitting cat's eyes for a moment without disturbing its loop.
     func blink(for duration: CFTimeInterval = 0.13) {
-        guard let loop, loop.pose == .sit, loop.duration > 0 else { return }
-        let frames = CatFrame.loop(.sit, facingRight: loop.facingRight)
-        guard !frames.isEmpty else { return }
-        let elapsed = (CACurrentMediaTime() - loop.start).truncatingRemainder(dividingBy: loop.duration)
-        let index = min(frames.count - 1, max(0, Int(elapsed / loop.duration * Double(frames.count))))
-        var state = frames[index].state
+        guard let loop, loop.pose == .sit, loop.shownIndex >= 0 else { return }
+        var state = loop.frames[loop.shownIndex].state
         state.eyes = .closed
         guard let image = render(state) else { return }
-
-        let lids = CAKeyframeAnimation(keyPath: "contents")
-        lids.values = [image]
-        lids.keyTimes = [0, 1]
-        lids.calculationMode = .discrete
-        lids.duration = duration
-        sprite.add(lids, forKey: "blink")
+        withoutImplicitAnimation { sprite.contents = image }
+        blinkUntil = CACurrentMediaTime() + duration
+        // A one-off wake-up to open the eyes again; the loop timer may be slower.
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            self?.tick()
+        }
     }
 
     override func viewDidChangeBackingProperties() {
@@ -178,14 +183,67 @@ final class CatView: NSView {
         }
     }
 
-    /// Debug: which cached frame the compositor is showing at this instant.
-    var debugPresentedFrame: String {
-        guard let shown = sprite.presentation(), let contents = shown.contents else { return "nothing" }
-        let flipped = shown.transform.m11 < 0 ? " mirrored" : ""
-        if let key = cache.first(where: { $0.value === (contents as AnyObject) })?.key {
-            return "\(["walk", "sit", "sleep"][key.pose])#\(key.step)\(flipped)"
+    // MARK: Ticking
+
+    /// The loop's natural frame rate, or the walking rate while moving.
+    private var wantedRate: Double {
+        if slideState != nil { return Self.walkingFPS }
+        guard let loop else { return 0 }
+        return min(Self.walkingFPS, max(2, Double(loop.frames.count) / loop.duration))
+    }
+
+    private func updateTimer() {
+        let rate = wantedRate
+        guard rate != timerRate else { return }
+        timerRate = rate
+        timer?.invalidate()
+        timer = nil
+        guard rate > 0 else { return }
+        let t = Timer(timeInterval: 1 / rate, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
         }
-        return "live\(flipped)"
+        t.tolerance = 0.1 / rate
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func tick() {
+        // Nothing to draw while the cat's window is hidden.
+        guard window?.isVisible == true else { return }
+        let now = CACurrentMediaTime()
+        withoutImplicitAnimation {
+            if let slide = slideState {
+                let t = min(1, max(0, (now - slide.start) / slide.duration))
+                let x = slide.from + (slide.to - slide.from) * CGFloat(t)
+                let snapped = (x * 2).rounded() / 2
+                sprite.position = CGPoint(x: snapped + catSize.width / 2, y: catSize.height / 2)
+                if t >= 1 { slideState = nil }
+            }
+            if now >= blinkUntil { showLoopFrame(force: blinkUntil > 0) ; blinkUntil = 0 }
+        }
+        if slideState == nil && timerRate == Self.walkingFPS { updateTimer() }
+    }
+
+    /// Debug: what the cat shows right now, and how often its timer ticks.
+    var debugPresentedFrame: String {
+        let flipped = sprite.transform.m11 < 0 ? " mirrored" : ""
+        if let loop, loop.shownIndex >= 0 {
+            return "\(loop.pose)#\(loop.shownIndex)\(flipped) @\(Int(timerRate))Hz"
+        }
+        return "live\(flipped) @\(Int(timerRate))Hz"
+    }
+
+    private func showLoopFrame(force: Bool) {
+        guard var current = loop else { return }
+        let elapsed = (CACurrentMediaTime() - current.start).truncatingRemainder(dividingBy: current.duration)
+        let index = min(current.images.count - 1, max(0, Int(elapsed / current.duration * Double(current.images.count))))
+        guard force || index != current.shownIndex else { return }
+        current.shownIndex = index
+        loop = current
+        withoutImplicitAnimation {
+            sprite.contents = current.images[index]
+            sprite.transform = current.frames[index].mirrored ? Self.mirror : CATransform3DIdentity
+        }
     }
 
     // MARK: Frames

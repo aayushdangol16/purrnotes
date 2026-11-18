@@ -135,7 +135,7 @@ final class PetController: NSObject {
         cat.facingRight = Bool.random()
         guard !isHidden else { return }
         window.orderFrontRegardless()
-        sit(for: 1.2)
+        sit(for: Self.pinnedMode == nil ? 1.2 : 0.2)
     }
 
     // MARK: Geometry
@@ -283,7 +283,16 @@ final class PetController: NSObject {
         sit(for: .random(in: 2...5))
     }
 
+    /// Debug: `--pet-mode walk|sit|sleep` pins the cat to one behaviour, for measuring its cost.
+    private static let pinnedMode = DebugTools.argument(after: "--pet-mode")
+
     private func chooseNext() {
+        switch Self.pinnedMode {
+        case "walk": walk(); return
+        case "sit": sit(for: 5); return
+        case "sleep": nap(); return
+        default: break
+        }
         if notesOpen {
             sit(for: 4)
             return

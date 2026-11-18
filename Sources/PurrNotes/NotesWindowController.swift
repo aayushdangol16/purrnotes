@@ -10,6 +10,8 @@ private final class NotesPanel: NSPanel {
 @MainActor
 final class NotesWindowController: NSObject, NSWindowDelegate {
     private static let sizeKey = "notesWindowSize"
+    /// Wide enough for the Notes / To-Do / Work switch plus the note buttons.
+    static let minSize = NSSize(width: 320, height: 240)
 
     var onVisibilityChange: ((Bool) -> Void)?
     var isOpen: Bool { panel.isVisible }
@@ -20,16 +22,18 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
     private let store: NotesStore
     private let todos: TodoStore
     private let state: PanelState
+    private let workstation: Workstation
 
-    init(store: NotesStore, todos: TodoStore, state: PanelState) {
+    init(store: NotesStore, todos: TodoStore, state: PanelState, workstation: Workstation) {
         self.store = store
         self.todos = todos
         self.state = state
+        self.workstation = workstation
 
         var size = NSSize(width: 340, height: 400)
         if let saved = UserDefaults.standard.string(forKey: Self.sizeKey) {
             let s = NSSizeFromString(saved)
-            if s.height >= 240 { size = NSSize(width: max(s.width, 280), height: s.height) }
+            if s.height >= Self.minSize.height { size = NSSize(width: max(s.width, Self.minSize.width), height: s.height) }
         }
 
         panel = NotesPanel(contentRect: NSRect(origin: .zero, size: size),
@@ -46,12 +50,12 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        panel.minSize = NSSize(width: 280, height: 240)
+        panel.minSize = Self.minSize
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             panel.standardWindowButton(button)?.isHidden = true
         }
 
-        let hosting = NSHostingView(rootView: NotesRootView(store: store, todos: todos, panel: state, onClose: { [weak self] in
+        let hosting = NSHostingView(rootView: NotesRootView(store: store, todos: todos, panel: state, workstation: workstation, onClose: { [weak self] in
             self?.close()
         }))
         hosting.sizingOptions = []
@@ -77,7 +81,11 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
-        if state.tab == .notes { store.requestFocus() } else { state.focusAddTask() }
+        switch state.tab {
+        case .notes: store.requestFocus()
+        case .todo: state.focusAddTask()
+        case .work: break
+        }
         onVisibilityChange?(true)
     }
 
@@ -90,6 +98,7 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
         UserDefaults.standard.set(NSStringFromSize(panel.frame.size), forKey: Self.sizeKey)
         store.tidyAndSave()
         todos.flush()
+        workstation.flush()
         onVisibilityChange?(false)
     }
 }

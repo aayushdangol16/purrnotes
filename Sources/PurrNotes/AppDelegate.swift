@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = NotesStore()
     private let todos = TodoStore()
     private let panelState = PanelState()
+    private let workstation = Workstation()
     private var pet: PetController!
     private var notes: NotesWindowController!
     private var statusItem: NSStatusItem!
@@ -20,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         buildMainMenu()
 
-        notes = NotesWindowController(store: store, todos: todos, state: panelState)
+        notes = NotesWindowController(store: store, todos: todos, state: panelState, workstation: workstation)
         pet = PetController()
         pet.onClick = { [weak self] in self?.toggleNotes() }
         pet.menuProvider = { [weak self] in
@@ -49,12 +50,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                   open: { [weak self] in self?.openNotes() },
                                   status: { [weak self] in self?.pet.debugStatus ?? "no cat" },
                                   perform: { [weak self] in self?.pet.debugPerform($0) },
-                                  todos: todos)
+                                  todos: todos,
+                                  workstation: workstation)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         store.flush()
         todos.flush()
+        workstation.flush()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -75,6 +78,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(item("New Note", #selector(newNote)))
         menu.addItem(item("New Task", #selector(newTask)))
+        menu.addItem(.separator())
+
+        switch workstation.phase {
+        case .idle:
+            let start = item("Start Workstation", #selector(startWorkstation))
+            if workstation.enabledApps.isEmpty { start.action = nil }   // greyed out until an app is switched on
+            menu.addItem(start)
+        case .starting:
+            menu.addItem(NSMenuItem(title: "Starting Workstation…", action: nil, keyEquivalent: ""))
+        case .active:
+            menu.addItem(item("End Workstation…", #selector(endWorkstation)))
+        case .ending:
+            menu.addItem(NSMenuItem(title: "Ending Workstation…", action: nil, keyEquivalent: ""))
+        }
+        menu.addItem(item("Workstation Settings…", #selector(openWorkTab)))
         menu.addItem(.separator())
 
         let sizeItem = NSMenuItem(title: "Cat Size", action: nil, keyEquivalent: "")
@@ -178,6 +196,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openTodoTab() {
         panelState.tab = .todo
         openNotes()
+    }
+
+    @objc private func openWorkTab() {
+        panelState.tab = .work
+        openNotes()
+    }
+
+    @objc private func startWorkstation() {
+        Task { await workstation.start() }
+    }
+
+    @objc private func endWorkstation() {
+        let names = workstation.ownedRunning.map(\.name)
+        if !names.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "Quit \(ListFormatter.localizedString(byJoining: names))?"
+            alert.informativeText = "These were opened by Workstation. Apps that were already open before you started stay open, and apps with unsaved work will ask before quitting."
+            alert.addButton(withTitle: "Quit Apps and End")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        Task { await workstation.end() }
     }
 
     @objc private func setSize(_ sender: NSMenuItem) {

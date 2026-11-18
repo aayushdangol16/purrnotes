@@ -146,7 +146,7 @@ final class TodoStore: NSObject, ObservableObject {
 /// The chosen tab is remembered between launches.
 @MainActor
 final class PanelState: ObservableObject {
-    enum Tab: String { case notes, todo }
+    enum Tab: String { case notes, todo, work }
 
     private static let tabKey = "panelTab"
 
